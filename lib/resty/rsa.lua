@@ -9,7 +9,12 @@ local ffi_new = ffi.new
 local ffi_gc = ffi.gc
 local ffi_copy = ffi.copy
 local ffi_str = ffi.string
-local C = ffi.C
+local C
+if ngx then
+  C=ffi.C
+else
+  C= ffi.load "ssl"
+end
 local tab_concat = table.concat
 local setmetatable = setmetatable
 
@@ -30,8 +35,11 @@ local KEY_TYPE = {
     PKCS1 = "PKCS#1",
     PKCS8 = "PKCS#8",
 }
-_M.KEY_TYPE = KEY_TYPE
 
+local RSA_F4=0x10001
+
+_M.KEY_TYPE = KEY_TYPE
+_M.RSA_F4=RSA_F4
 
 ffi.cdef[[
 typedef struct bio_st BIO;
@@ -41,7 +49,37 @@ BIO * BIO_new(BIO_METHOD *type);
 int BIO_puts(BIO *bp, const char *buf);
 void BIO_vfree(BIO *a);
 
+struct crypto_ex_data_st {
+    void *sk;
+    int dummy;
+};
+typedef struct bignum_st BIGNUM;
+typedef struct crypto_ex_data_st CRYPTO_EX_DATA;
+struct rsa_st {
+    int pad;
+    long version;
+    const void *meth;
+    void *engine;
+    BIGNUM *n;
+    BIGNUM *e;
+    BIGNUM *d;
+    BIGNUM *p;
+    BIGNUM *q;
+    BIGNUM *dmp1;
+    BIGNUM *dmq1;
+    BIGNUM *iqmp;
+    CRYPTO_EX_DATA ex_data;
+    int references;
+    int flags;
+    void *_method_mod_n;
+    void *_method_mod_p;
+    void *_method_mod_q;
+    char *bignum_data;
+    void *blinding;
+    void *mt_blinding;
+};
 typedef struct rsa_st RSA;
+
 RSA *RSA_new(void);
 void RSA_free(RSA *rsa);
 typedef int pem_password_cb(char *buf, int size, int rwflag, void *userdata);
@@ -55,10 +93,9 @@ RSA * PEM_read_bio_RSA_PUBKEY(BIO *bp, RSA **rsa, pem_password_cb *cb,
 unsigned long ERR_get_error_line_data(const char **file, int *line,
                                       const char **data, int *flags);
 const char * ERR_reason_error_string(unsigned long e);
-
-typedef struct bignum_st BIGNUM;
 BIGNUM *BN_new(void);
 void BN_free(BIGNUM *a);
+int BN_hex2bn(BIGNUM **a, const char *str);
 typedef unsigned long BN_ULONG;
 int BN_set_word(BIGNUM *a, BN_ULONG w);
 typedef struct bn_gencb_st BN_GENCB;
@@ -264,20 +301,38 @@ function _M.new(_, opts)
     elseif opts.private_key then
         key = opts.private_key
         read_func = C.PEM_read_bio_RSAPrivateKey
-
+    elseif opts.modulus and opts.exponent then
+        is_pub=true
+        read_func=function()
+          local r=C.RSA_new()
+          local bnn=ffi.new('BIGNUM*[1]')
+          bnn[0]=C.BN_new()
+          assert(0~=C.BN_hex2bn(bnn,opts.modulus),'BN_hex2bn failed with modulus')
+          local bne=ffi.new('BIGNUM*[1]')
+          bne[0]=C.BN_new()
+          C.BN_set_word(bne[0],RSA_F4)
+          assert(0~=C.BN_hex2bn(bne,opts.exponent),'BN_hex2bn failed with exponent')
+          r.n=bnn[0]
+          r.e=bne[0]
+          r.d=nil
+          print('got modulus:',opts.modulus,', exponent:',opts.exponent)
+          return r
+        end
     else
         return nil, "public_key or private_key not found"
     end
 
-    local bio_method = C.BIO_s_mem()
-    local bio = C.BIO_new(bio_method)
-    ffi_gc(bio, C.BIO_vfree)
+    local bio_method,bio,len
+    if key then
+      bio_method= C.BIO_s_mem()
+      bio = C.BIO_new(bio_method)
+      ffi_gc(bio, C.BIO_vfree)
 
-    local len = C.BIO_puts(bio, key)
-    if len < 0 then
-        return ssl_err()
+      len = C.BIO_puts(bio, key)
+      if len < 0 then
+          return ssl_err()
+      end
     end
-
     local pass
     if opts.password then
         local plen = #opts.password
@@ -330,6 +385,7 @@ function _M.new(_, opts)
     end
 
     local size = C.EVP_PKEY_size(pkey)
+    print('key size=',size)
     return setmetatable({
             pkey = pkey,
             size = size,
@@ -369,15 +425,14 @@ function _M.encrypt(self, str)
     end
 
     local len = ffi_new("size_t [1]")
+
     if C.EVP_PKEY_encrypt(ctx, nil, len, str, #str) <= 0 then
         return ssl_err()
     end
-
     local buf = self.buf
     if C.EVP_PKEY_encrypt(ctx, buf, len, str, #str) <= 0 then
         return ssl_err()
     end
-
     return ffi_str(buf, len[0])
 end
 
