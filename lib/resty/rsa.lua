@@ -37,49 +37,70 @@ local KEY_TYPE = {
 }
 
 local RSA_F4=0x10001
+local set0_key_version=0x10100000
 
 _M.KEY_TYPE = KEY_TYPE
 _M.RSA_F4=RSA_F4
-
 ffi.cdef[[
+unsigned long OpenSSL_version_num();
+]]
+local before_rsa_defs,after_rsa_defs,has_set0api
+if C.OpenSSL_version_num()<set0_key_version then
+   before_rsa_defs=[[
+   struct crypto_ex_data_st {
+       void *sk;
+       int dummy;
+   };
+   typedef struct crypto_ex_data_st CRYPTO_EX_DATA;
+   struct rsa_st {
+       int pad;
+       long version;
+       const void *meth;
+       void *engine;
+       BIGNUM *n;
+       BIGNUM *e;
+       BIGNUM *d;
+       BIGNUM *p;
+       BIGNUM *q;
+       BIGNUM *dmp1;
+       BIGNUM *dmq1;
+       BIGNUM *iqmp;
+       CRYPTO_EX_DATA ex_data;
+       int references;
+       int flags;
+       void *_method_mod_n;
+       void *_method_mod_p;
+       void *_method_mod_q;
+       char *bignum_data;
+       void *blinding;
+       void *mt_blinding;
+   };
+]]
+  after_rsa_defs=''
+else
+  has_set0api=true
+  before_rsa_defs=''
+  after_rsa_defs=[[
+  int RSA_set0_key(RSA* r, BIGNUM* n, BIGNUM* e, BIGNUM* d);
+  ]]
+end
+local ssl_cdefs=[[
 typedef struct bio_st BIO;
 typedef struct bio_method_st BIO_METHOD;
 BIO_METHOD *BIO_s_mem(void);
 BIO * BIO_new(BIO_METHOD *type);
 int BIO_puts(BIO *bp, const char *buf);
 void BIO_vfree(BIO *a);
-
-struct crypto_ex_data_st {
-    void *sk;
-    int dummy;
-};
 typedef struct bignum_st BIGNUM;
-typedef struct crypto_ex_data_st CRYPTO_EX_DATA;
-struct rsa_st {
-    int pad;
-    long version;
-    const void *meth;
-    void *engine;
-    BIGNUM *n;
-    BIGNUM *e;
-    BIGNUM *d;
-    BIGNUM *p;
-    BIGNUM *q;
-    BIGNUM *dmp1;
-    BIGNUM *dmq1;
-    BIGNUM *iqmp;
-    CRYPTO_EX_DATA ex_data;
-    int references;
-    int flags;
-    void *_method_mod_n;
-    void *_method_mod_p;
-    void *_method_mod_q;
-    char *bignum_data;
-    void *blinding;
-    void *mt_blinding;
-};
+]]..
+before_rsa_defs
+..
+[[
 typedef struct rsa_st RSA;
-
+]]..
+after_rsa_defs
+..
+[[
 RSA *RSA_new(void);
 void RSA_free(RSA *rsa);
 typedef int pem_password_cb(char *buf, int size, int rwflag, void *userdata);
@@ -172,6 +193,7 @@ void ERR_set_error_data(char *data, int flags);
 # define EVP_SignUpdate(a,b,c)           EVP_DigestUpdate(a,b,c)
 --]]
 
+ffi.cdef(ssl_cdefs)
 
 local EVP_PKEY_ALG_CTRL = 0x1000
 local EVP_PKEY_CTRL_RSA_PADDING = EVP_PKEY_ALG_CTRL + 1
@@ -310,12 +332,15 @@ function _M.new(_, opts)
           assert(0~=C.BN_hex2bn(bnn,opts.modulus),'BN_hex2bn failed with modulus')
           local bne=ffi.new('BIGNUM*[1]')
           bne[0]=C.BN_new()
-          C.BN_set_word(bne[0],RSA_F4)
           assert(0~=C.BN_hex2bn(bne,opts.exponent),'BN_hex2bn failed with exponent')
-          r.n=bnn[0]
-          r.e=bne[0]
-          r.d=nil
-          print('got modulus:',opts.modulus,', exponent:',opts.exponent)
+          if has_set0api then
+             C.RSA_set0_key(r,bnn[0],bne[0],nil)
+          else
+            r.n=bnn[0]
+            r.e=bne[0]
+            r.d=nil
+          end
+          --print('got modulus:',opts.modulus,', exponent:',opts.exponent)
           return r
         end
     else
@@ -385,7 +410,7 @@ function _M.new(_, opts)
     end
 
     local size = C.EVP_PKEY_size(pkey)
-    print('key size=',size)
+    --print('key size=',size)
     return setmetatable({
             pkey = pkey,
             size = size,
