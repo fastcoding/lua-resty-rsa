@@ -45,7 +45,10 @@ ffi.cdef[[
 unsigned long OpenSSL_version_num();
 ]]
 local before_rsa_defs,after_rsa_defs,has_set0api
-if C.OpenSSL_version_num()<set0_key_version then
+local ok,ver=pcall(function()
+return C.OpenSSL_version_num()
+end)
+if not ok or ver<set0_key_version then
    before_rsa_defs=[[
    struct crypto_ex_data_st {
        void *sk;
